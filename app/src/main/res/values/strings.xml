@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AegisWake</string>
+    <string name="aegis_acc_description">Tap the voice button in ChatGPT automatically.</string>
+</resources>
