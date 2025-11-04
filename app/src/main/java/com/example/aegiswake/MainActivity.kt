@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.*
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -29,12 +28,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var btnStop: Button
     private lateinit var btnPlay: Button
     private lateinit var btnStartVoice: Button
+    private lateinit var btnWakeStart: Button
+    private lateinit var btnWakeStop: Button
 
     // --- permissions prompts ---
     private val askMic =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { refreshStatus() }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { refreshStatus(); startWakeServiceIfReady() }
     private val askNotif =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { refreshStatus() }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { refreshStatus(); startWakeServiceIfReady() }
 
     // --- audio config ---
     private val sampleRate = 16_000
@@ -51,7 +52,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // simple vertical UI
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 96, 48, 48)
@@ -78,21 +78,36 @@ class MainActivity : ComponentActivity() {
             text = "Start ChatGPT Voice"
             setOnClickListener { startChatGptVoiceFlow() }
         }
+        btnWakeStart = Button(this).apply {
+            text = "Start Wakeword Service"
+            setOnClickListener { startWakeServiceIfReady() }
+        }
+        btnWakeStop = Button(this).apply {
+            text = "Stop Wakeword Service"
+            setOnClickListener { stopWakeService() }
+        }
 
-        root.addView(status)
-        root.addView(btnPerms)
-        root.addView(btnStart)
-        root.addView(btnStop)
-        root.addView(btnPlay)
-        root.addView(btnStartVoice)
+        with(root) {
+            addView(status)
+            addView(btnPerms)
+            addView(btnStart)
+            addView(btnStop)
+            addView(btnPlay)
+            addView(btnStartVoice)
+            addView(btnWakeStart)
+            addView(btnWakeStop)
+        }
+
         setContentView(root)
 
         refreshStatus()
+        startWakeServiceIfReady() // auto-start if perms already granted
     }
 
     override fun onResume() {
         super.onResume()
         refreshStatus()
+        startWakeServiceIfReady()
     }
 
     override fun onDestroy() {
@@ -103,13 +118,10 @@ class MainActivity : ComponentActivity() {
     // ---------------- Permissions & Status ----------------
 
     private fun requestNeededPerms() {
-        if (!hasMic()) {
-            askMic.launch(Manifest.permission.RECORD_AUDIO); return
-        }
-        if (Build.VERSION.SDK_INT >= 33 && !hasNotif()) {
-            askNotif.launch(Manifest.permission.POST_NOTIFICATIONS); return
-        }
+        if (!hasMic()) { askMic.launch(Manifest.permission.RECORD_AUDIO); return }
+        if (Build.VERSION.SDK_INT >= 33 && !hasNotif()) { askNotif.launch(Manifest.permission.POST_NOTIFICATIONS); return }
         refreshStatus()
+        startWakeServiceIfReady()
     }
 
     private fun refreshStatus() {
@@ -126,6 +138,22 @@ class MainActivity : ComponentActivity() {
     private fun hasNotif(): Boolean =
         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
+    // ---------------- Wakeword Service control ----------------
+
+    private fun listeningReady(): Boolean =
+        hasMic() && (Build.VERSION.SDK_INT < 33 || hasNotif())
+
+    private fun startWakeServiceIfReady() {
+        if (!listeningReady()) return
+        ContextCompat.startForegroundService(
+            this, Intent(this, MainService::class.java)
+        )
+    }
+
+    private fun stopWakeService() {
+        stopService(Intent(this, MainService::class.java))
+    }
+
     // ---------------- Manual ChatGPT Voice Flow ----------------
 
     private fun startChatGptVoiceFlow() {
@@ -137,7 +165,6 @@ class MainActivity : ComponentActivity() {
 
         val launch = resolveChatGptLaunchIntent()
         if (launch == null) {
-            // quick diagnostics: list anything we found that looked close
             val pm = packageManager
             val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val apps = pm.queryIntentActivities(main, 0)
@@ -147,7 +174,6 @@ class MainActivity : ComponentActivity() {
 
             Toast.makeText(this, "ChatGPT app not found.\nCandidates:\n$near", Toast.LENGTH_LONG).show()
 
-            // Play Store fallback
             val pkg = "com.openai.chatgpt"
             try {
                 startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("market://details?id=$pkg")))
@@ -157,28 +183,24 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        startActivity(launch)
-        // Accessibility service will take over and tap the mic.
-    }
+        // Ask our AccessibilityService to arm a single press once the UI is ready
+        AegisAccessibilityService.instance?.requestPressButton()
 
+        // Launch ChatGPT
+        startActivity(launch)
+    }
 
     private fun resolveChatGptLaunchIntent(): Intent? {
         val pm = packageManager
-
-        // 1) direct known package
         pm.getLaunchIntentForPackage("com.openai.chatgpt")?.let { return it }
 
-        // 2) search all launchable activities (needs <queries> intent block on Android 11+)
         val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(main, 0)
-
-        // Prefer packages that look like OpenAI / labels that look like ChatGPT
         val candidates = apps.sortedBy { it.activityInfo.packageName }.filter { ri ->
             val pkg = ri.activityInfo.packageName.lowercase()
             val label = ri.loadLabel(pm)?.toString()?.lowercase() ?: ""
             pkg.contains("openai") || label.contains("chatgpt")
         }
-
         if (candidates.isNotEmpty()) {
             val ri = candidates.first()
             return Intent(Intent.ACTION_MAIN).apply {
@@ -187,21 +209,16 @@ class MainActivity : ComponentActivity() {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             }
         }
-
         return null
     }
 
-
     private fun isAegisAccessibilityEnabled(): Boolean {
-        // naive check: see if any accessibility services are enabled for this package
-        // (exact check requires parsing Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
         return try {
-            // if user enabled it, our service will get events — this is just a gentle pre-check
             Settings.Secure.getInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0) == 1
         } catch (_: Exception) { false }
     }
 
-    // ---------------- Recording ----------------
+    // ---------------- Simple WAV recorder (manual testing) ----------------
 
     private fun startRecordingSafe() {
         if (isRecording) return
@@ -233,7 +250,7 @@ class MainActivity : ComponentActivity() {
         wavFile = File(cacheDir, "last_capture.wav")
 
         val minBytes = AudioRecord.getMinBufferSize(sampleRate, channelMask, audioFormat)
-        val bufBytes = max(minBytes, sampleRate * bytesPerSample) // >= 1s buffer
+        val bufBytes = max(minBytes, sampleRate * bytesPerSample)
         recorder = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             .setAudioFormat(
@@ -247,9 +264,7 @@ class MainActivity : ComponentActivity() {
             .build()
 
         val rec = recorder ?: throw IllegalStateException("AudioRecord null")
-        if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            throw IllegalStateException("AudioRecord init failed")
-        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) throw IllegalStateException("AudioRecord init failed")
 
         val fos = FileOutputStream(wavFile, false)
         writeWavHeader(fos, sampleRate, 1, 16, 0)
@@ -282,14 +297,12 @@ class MainActivity : ComponentActivity() {
 
     private fun stopRecording() {
         isRecording = false
-        try { recorder?.stop() } catch (_: Exception) { }
+        try { recorder?.stop() } catch (_: Exception) {}
         recorder?.release()
         recorder = null
-        try { recordThread?.join(500) } catch (_: Exception) { }
+        try { recordThread?.join(500) } catch (_: Exception) {}
         recordThread = null
     }
-
-    // ---------------- Playback ----------------
 
     private fun playLast() {
         val f = File(cacheDir, "last_capture.wav")
@@ -298,7 +311,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
-            val mp = MediaPlayer().apply {
+            MediaPlayer().apply {
                 setDataSource(f.absolutePath)
                 setOnCompletionListener { it.release() }
                 setOnPreparedListener { it.start() }
@@ -308,8 +321,6 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Play failed: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
-
-    // ---------------- WAV helpers ----------------
 
     private fun writeWavHeader(
         out: FileOutputStream, sampleRate: Int, channels: Int, bitsPerSample: Int, dataSize: Int
@@ -351,4 +362,29 @@ class MainActivity : ComponentActivity() {
         (v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte(),
         ((v shr 16) and 0xFF).toByte(), ((v shr 24) and 0xFF).toByte()
     )
+
+    companion object {
+        const val EXTRA_START_VOICE = "EXTRA_START_VOICE"
+        fun startVoiceFlow(ctx: android.content.Context) {
+            ctx.startActivity(
+                Intent(ctx, MainActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
+                    putExtra(EXTRA_START_VOICE, true)
+                }
+            )
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent?.getBooleanExtra(EXTRA_START_VOICE, false) == true) {
+            // Arm a single press and launch ChatGPT
+            AegisAccessibilityService.instance?.requestPressButton()
+            startChatGptVoiceFlow()
+        }
+    }
 }

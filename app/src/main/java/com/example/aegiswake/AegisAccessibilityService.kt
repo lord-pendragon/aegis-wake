@@ -3,17 +3,23 @@ package com.example.aegiswake
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import kotlin.math.max
+import android.view.accessibility.AccessibilityWindowInfo
+import android.os.Handler
+import android.os.Looper
 
 class AegisAccessibilityService : AccessibilityService() {
+
+    companion object {
+        @Volatile var instance: AegisAccessibilityService? = null
+    }
+
     private val TAG = "AegisAcc"
     private val h = Handler(Looper.getMainLooper())
 
@@ -28,7 +34,11 @@ class AegisAccessibilityService : AccessibilityService() {
     private var suppressUntil = 0L
     private fun now() = System.currentTimeMillis()
 
+    @Volatile private var pendingPress = false
+    fun requestPressButton() { pendingPress = true }
+
     override fun onServiceConnected() {
+        instance = this
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -41,24 +51,22 @@ class AegisAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val pkg = (event?.packageName ?: "").toString()
-        val cls = (event?.className ?: "").toString()
-        if (now() < suppressUntil) return            // ⛔ debounce window
+        if (!pendingPress) return
 
-        // Reset when we’re not in ChatGPT
+        val pkg = (event?.packageName ?: "").toString()
+        if (now() < suppressUntil) return
         if (!pkg.contains("openai", ignoreCase = true)) {
             fired = false
             return
         }
-        Log.d(TAG, "event from pkg=$pkg cls=$cls type=${event?.eventType}")
+        Log.d(TAG, "event from pkg=$pkg cls=${event?.className} type=${event?.eventType}")
 
-        if (fired) return                            // already started → ignore
+        if (fired) return
 
         h.removeCallbacksAndMessages(null)
         attempt = 0
         h.postDelayed(::tryStartVoiceLoop, 450)
     }
-
 
     override fun onInterrupt() {}
 
@@ -79,45 +87,44 @@ class AegisAccessibilityService : AccessibilityService() {
         }
 
         // Already active? (stop button present)
-        // already active?
         findClickable(root, stopLabels)?.let {
             Log.d(TAG, "Voice already active — stop button present")
             fired = true
-            suppressUntil = now() + 4000                 // ignore for 4s
+            pendingPress = false
+            suppressUntil = now() + 4000
             return true
         }
 
-
-        // (Optional) Exact viewId match — uncomment once you see the id in dumpTree
+        // Exact id (uncomment when you discover it with dumpTree)
         // findByViewId(root, "com.openai.chatgpt:id/composer_speech_button")?.let {
-        //     if (clickNode(it)) { Log.d(TAG, "Tapped via viewId"); return true }
+        //     if (clickNode(it)) {
+        //         Log.d(TAG, "Tapped via viewId")
+        //         fired = true; pendingPress = false
+        //         suppressUntil = now() + 4000
+        //         return true
+        //     }
         // }
 
         // Label match
         findClickable(root, startLabels)?.let { node ->
             if (clickNode(node)) {
                 Log.d(TAG, "Tapped via label match")
-                fired = true
+                fired = true; pendingPress = false
                 suppressUntil = now() + 4000
                 return true
             }
         }
 
-        // Heuristic: bottom-right clickable
+        // Heuristic: bottom-right clickable, or tap just to the right of it
         val screen = Rect(); root.getBoundsInScreen(screen)
-
-// Try the rightmost clickable in the bottom band
         rightmostClickableInBottomBand(root, screen)?.let { (node, r) ->
             Log.d(TAG, "Rightmost candidate id=${node.viewIdResourceName} cls=${node.className} bounds=$r")
-            // First: try clicking the node itself
             if (clickNode(node)) {
                 Log.d(TAG, "Tapped via bottom-right node")
-                fired = true
+                fired = true; pendingPress = false
                 suppressUntil = now() + 4000
                 return true
             }
-
-            // Second: tap a few dp **to the right** of that node’s right edge
             val bump = dp(18f)
             val safetyRight = dp(6f)
             val safetyBot = dp(10f)
@@ -127,24 +134,28 @@ class AegisAccessibilityService : AccessibilityService() {
             val y = (r.centerY().toFloat()).coerceAtMost(yMax)
             if (tap(x, y)) {
                 Log.d(TAG, "Tapped to the RIGHT of candidate at ($x,$y)")
-                fired = true
+                fired = true; pendingPress = false
                 suppressUntil = now() + 4000
                 return true
             }
         }
 
-
-        // Fallback: gesture taps (IME-aware)
+        // Fallback: gesture taps along safe bottom-right band
         for ((x, y) in fallbackTapPoints(screen)) {
-            if (tap(x, y)) { Log.d(TAG, "Tapped by gesture at ($x,$y)"); return true }
+            if (tap(x, y)) {
+                Log.d(TAG, "Tapped by gesture at ($x,$y)")
+                fired = true; pendingPress = false
+                suppressUntil = now() + 4000
+                return true
+            }
         }
 
-        // First couple attempts: dump the tree to learn stable ids/labels
+        // Help discover stable ids/labels
         if (attempt <= 2) dumpTree(root, 0)
         return false
     }
 
-    // ---- root resolution ----
+    // ---- root/window helpers ----
     private fun resolveRoot(): AccessibilityNodeInfo? {
         rootInActiveWindow?.let { return it }
         val wins = windows ?: return null
@@ -184,19 +195,14 @@ class AegisAccessibilityService : AccessibilityService() {
         val list = mutableListOf<Pair<AccessibilityNodeInfo, Rect>>()
         collectClickable(root, list)
         if (list.isEmpty()) return null
-
-        val bottomBandTop = (screen.bottom * 0.70f).toInt()  // bottom 30% of screen
-        // Keep only clickables inside the bottom band and within screen bounds
+        val bottomBandTop = (screen.bottom * 0.70f).toInt()
         val candidates = list.filter { (_, r) ->
             !r.isEmpty && r.centerY() >= bottomBandTop &&
                     r.left >= 0 && r.right <= screen.right && r.bottom <= screen.bottom
         }
         if (candidates.isEmpty()) return null
-
-        // Pick the one with the **largest X** (rightmost center)
         return candidates.maxByOrNull { (_, r) -> r.centerX() }
     }
-
 
     private fun collectClickable(node: AccessibilityNodeInfo, out: MutableList<Pair<AccessibilityNodeInfo, Rect>>) {
         val r = Rect(); node.getBoundsInScreen(r)
@@ -222,11 +228,11 @@ class AegisAccessibilityService : AccessibilityService() {
 
     // --- IME detection / dismissal ---
     private fun findImeWindowBounds(): Rect? {
-        val wins = windows ?: return null
+        val wins: List<AccessibilityWindowInfo> = windows ?: return null
         for (w in wins) {
-            if (w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+            if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
                 val r = Rect()
-                w.getBoundsInScreen(r)      // ✅ correct call
+                w.getBoundsInScreen(r)
                 if (!r.isEmpty) return r
             }
         }
@@ -237,13 +243,12 @@ class AegisAccessibilityService : AccessibilityService() {
         val ime = findImeWindowBounds() ?: return false
         Log.d(TAG, "IME bounds: $ime")
         performGlobalAction(GLOBAL_ACTION_BACK)
-        // small delay so next attempt sees IME gone
         h.postDelayed({}, 120)
         return true
     }
 
-    private fun dp(px: Float): Float =
-        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, px, resources.displayMetrics)
+    private fun dp(dpVal: Float): Float =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, dpVal, resources.displayMetrics)
 
     private fun fallbackTapPoints(screen: Rect): List<Pair<Float, Float>> {
         val ime = findImeWindowBounds()
@@ -252,8 +257,6 @@ class AegisAccessibilityService : AccessibilityService() {
         val safetyY = dp(10f)
         val y = (imeTop.toFloat() - safetyY).coerceAtMost(screen.bottom - safetyY)
         val xRight = screen.right - safetyX
-
-        // Try strict bottom-right, then nudge left/up a little if needed
         val step = dp(16f)
         return listOf(
             xRight to y,
@@ -264,7 +267,6 @@ class AegisAccessibilityService : AccessibilityService() {
             (xRight - step) to (y - step),
         )
     }
-
 
     private fun dumpTree(node: AccessibilityNodeInfo?, depth: Int) {
         if (node == null) return

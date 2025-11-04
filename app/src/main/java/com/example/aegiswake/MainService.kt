@@ -1,70 +1,94 @@
 package com.example.aegiswake
 
-import android.app.*
-import android.content.*
-import android.media.*
-import android.os.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Build
+import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import org.tensorflow.lite.Interpreter
 import java.io.ByteArrayOutputStream
+import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import kotlin.math.max
+import kotlin.math.sqrt
 
 class MainService : Service() {
 
-    // ---- config ----
+    // ---- constants (OWW-friendly) ----
+    private val SAMPLE_RATE = 16_000
+    private val FRAME_MS = 80
+    private val FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000 // 1280
+    private val WINDOW_SAMPLES = SAMPLE_RATE                  // 1s
+
+    private val WARMUP_MS = 1200L
+    private val COOLDOWN_MS = 5000L
+    private val DETECT_THRESH = 0.88f
+
+    // 0.88 = Doesnt Work
+    // 0.87 = Works if super duper close to the mic
+    // 0.86 = Works if super close to the mic
+    // 0.84 = Works
+    // 0.77 = Works but too sensitive
+    // 0.70 = Works
+    private val SMOOTH_N = 8
+
+    // ---- notif ----
     private val CHANNEL_ID = "aegis_wake"
     private val NOTIF_ID = 1
     private val ERR_ID = 2
 
-    private val modelAssetName = "aegis_oww.tflite"
-    private val sampleRate = 16_000
-    private val frameMs = 80
-    private val frameSamples = sampleRate * frameMs / 1000 // 1280
-    private val winSamples = sampleRate                    // 1s = 16000
-    private val detectionThreshold = 0.50f
-    private val cooldownMs = 2500L
-    private val startupGraceMs = 3000L                     // ignore first 3s
-    private val smoothN = 8                                // frames for avg
-
-    // ---- runtime ----
+    // ---- model ----
+    private val MODEL_ASSET = "aegis_oww.tflite"
     private var tflite: Interpreter? = null
-    private var audioThread: Thread? = null
-    @Volatile private var running = false
-    private var lastTriggerTs = 0L
-    private var serviceStart = 0L
 
-    // 1s ring buffer
-    private val ring = ShortArray(winSamples)
+    // ---- loop state ----
+    @Volatile private var running = false
+    private var audioThread: Thread? = null
+    private var serviceStartAt = 0L
+    private var lastUiTick = 0L
+    private var lastTriggerAt = 0L
+
+    // 1s ring buffer for inference
+    private val ring = ShortArray(WINDOW_SAMPLES)
     private var ringPos = 0
     private var filled = 0
-
 
     override fun onCreate() {
         super.onCreate()
         ensureChannel()
-        startForeground(NOTIF_ID, buildNotification("Aegis is listening"))
-        serviceStart = SystemClock.elapsedRealtime()
+        startForeground(NOTIF_ID, buildNotification("Starting…"))
+        serviceStartAt = SystemClock.elapsedRealtime()
 
         try {
-            tflite = Interpreter(loadModelFromAssets(modelAssetName), Interpreter.Options().apply {
-                setNumThreads(2)
-            })
-            running = true
-            audioThread = Thread({ audioLoop() }, "AegisWake-AudioLoop").also { it.start() }
+            val opts = Interpreter.Options().apply { setNumThreads(2) }
+            tflite = Interpreter(loadModelFromAssets(MODEL_ASSET), opts)
+            updateNotification("Model loaded, preparing mic…")
         } catch (e: Exception) {
-            notifyError("Init error: ${e.message}")
+            notifyError("Model init error: ${e.message ?: "unknown"}")
             stopSelf()
+            return
         }
+
+        running = true
+        audioThread = Thread({ audioLoop() }, "AegisWake-AudioLoop").also { it.start() }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         running = false
-        try { audioThread?.join(500) } catch (_: Exception) {}
+        try { audioThread?.join(800) } catch (_: Exception) {}
         try { tflite?.close() } catch (_: Exception) {}
         tflite = null
         super.onDestroy()
@@ -72,82 +96,136 @@ class MainService : Service() {
 
     override fun onBind(intent: Intent?) = null
 
-    // ---- audio + inference ----
+    // ---- audio + inference loop ----
     private fun audioLoop() {
-        val minBytes = AudioRecord.getMinBufferSize(
-            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+
+        // Build AudioRecord with fallbacks
+        val attemptOrder = listOf(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION to "VOICE_RECOGNITION",
+            MediaRecorder.AudioSource.MIC to "MIC"
         )
-        val bufBytes = max(minBytes, frameSamples * 2 * 2) // generous
 
-        val record = AudioRecord.Builder()
-            .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(sampleRate)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                    .build()
+        var record: AudioRecord? = null
+        var sourceUsed = "?"
+        var minBytes = 0
+
+        for ((src, name) in attemptOrder) {
+            val min = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
             )
-            .setBufferSizeInBytes(bufBytes)
-            .build()
+            minBytes = if (min > 0) min else SAMPLE_RATE * 2
+            val bufBytes = max(minBytes, SAMPLE_RATE * 2 * 4) // ≥ 4s of 16-bit mono
 
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            notifyError("AudioRecord init failed"); stopSelf(); return
+            val candidate = try {
+                AudioRecord.Builder()
+                    .setAudioSource(src)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(SAMPLE_RATE)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufBytes)
+                    .build()
+            } catch (_: Exception) { null }
+
+            if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) {
+                record = candidate
+                sourceUsed = name
+                break
+            } else {
+                candidate?.release()
+            }
         }
 
-        val shortBuf = ShortArray(frameSamples)
-        val scores = ArrayDeque<Float>() // smoothing window
-
-        try { record.startRecording() } catch (e: Exception) {
-            notifyError("Mic start failed: ${e.message}"); stopSelf(); return
+        if (record == null) {
+            notifyError("Mic init failed (min=$minBytes). Grant mic permission & reopen app.")
+            stopSelf()
+            return
         }
+
+        updateNotification("Mic ready ($sourceUsed @16k). Starting…")
+
+        val frame = ShortArray(FRAME_SAMPLES)
+        val scores = ArrayDeque<Float>() // simple smoothing
+
+        try {
+            record.startRecording()
+        } catch (e: Exception) {
+            notifyError("Mic start failed: ${e.message}")
+            record.release()
+            stopSelf(); return
+        }
+
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            notifyError("Mic not recording (state=${record.recordingState}). Background capture blocked.")
+            record.release()
+            stopSelf(); return
+        } else {
+            updateNotification("Listening ($sourceUsed)…")
+        }
+
+        var zerosInARow = 0
 
         while (running) {
-            val n = record.read(shortBuf, 0, frameSamples, AudioRecord.READ_BLOCKING)
-            if (n <= 0) continue
+            // read one 80ms frame
+            val n = record.read(frame, 0, FRAME_SAMPLES, AudioRecord.READ_BLOCKING)
+            if (n <= 0) {
+                zerosInARow++
+                if (zerosInARow >= 10) tickUi("Mic stalled ($sourceUsed) n=$n")
+                continue
+            } else zerosInARow = 0
 
-            // (1) write frame into 1s ring
-            var rp = ringPos
+            // write to 1s ring
+            val rp = ringPos
             val end = rp + n
-            if (end <= winSamples) {
-                System.arraycopy(shortBuf, 0, ring, rp, n)
+            if (end <= WINDOW_SAMPLES) {
+                System.arraycopy(frame, 0, ring, rp, n)
             } else {
-                val first = winSamples - rp
-                System.arraycopy(shortBuf, 0, ring, rp, first)
-                System.arraycopy(shortBuf, first, ring, 0, n - first)
+                val first = WINDOW_SAMPLES - rp
+                System.arraycopy(frame, 0, ring, rp, first)
+                System.arraycopy(frame, first, ring, 0, n - first)
             }
-            ringPos = (rp + n) % winSamples
-            filled = (filled + n).coerceAtMost(winSamples)
+            ringPos = (rp + n) % WINDOW_SAMPLES
+            filled = (filled + n).coerceAtMost(WINDOW_SAMPLES)
 
-            // (2) require full 1s + grace period
-            val alive = SystemClock.elapsedRealtime() - serviceStart
-            if (filled < winSamples || alive < startupGraceMs) continue
+            // wait warmup + full window
+            val alive = SystemClock.elapsedRealtime() - serviceStartAt
+            if (alive < WARMUP_MS || filled < WINDOW_SAMPLES) {
+                tickUi("Warming up… ($sourceUsed)")
+                continue
+            }
 
-            // (3) build float window & quick VAD
-            val oneSec = FloatArray(winSamples)
+            // quick VAD from 1s window
+            val oneSec = FloatArray(WINDOW_SAMPLES)
             var idx = ringPos
             var sumSq = 0.0
-            for (i in 0 until winSamples) {
+            for (i in 0 until WINDOW_SAMPLES) {
                 val f = ring[idx] / 32768f
                 oneSec[i] = f
-                sumSq += f * f
-                idx++; if (idx == winSamples) idx = 0
+                sumSq += (f * f)
+                idx++; if (idx == WINDOW_SAMPLES) idx = 0
             }
-            val rms = Math.sqrt(sumSq / winSamples).toFloat()
-            if (rms < 0.01f) continue  // skip silence
+            val rms = sqrt(sumSq / WINDOW_SAMPLES).toFloat()
+            if (rms < 0.01f) {
+                tickUi("Silence… RMS=${"%.3f".format(rms)} ($sourceUsed)")
+                continue
+            }
 
-            // (4) inference, smoothing, rising edge
+            // infer & smooth
             val score = runOww(oneSec)
             scores.addLast(score)
-            if (scores.size > smoothN) scores.removeFirst()
+            if (scores.size > SMOOTH_N) scores.removeFirst()
             val avg = scores.average().toFloat()
-            val prevAvg = if (scores.size >= 2) scores.dropLast(1).average().toFloat() else 0f
+            tickUi("Listening… RMS=${"%.3f".format(rms)} score≈${"%.2f".format(avg)} ($sourceUsed)")
 
             val now = SystemClock.elapsedRealtime()
-            if (prevAvg < detectionThreshold && avg >= detectionThreshold && now - lastTriggerTs >= cooldownMs) {
-                lastTriggerTs = now
+            if (avg >= DETECT_THRESH && now - lastTriggerAt >= COOLDOWN_MS) {
+                lastTriggerAt = now
+                updateNotification("Wake word detected ($sourceUsed)")
                 triggerChatGptVoice()
-                updateNotification("Wake word detected")
             }
         }
 
@@ -164,20 +242,22 @@ class MainService : Service() {
         return out[0][0]
     }
 
-    // ---- launch ChatGPT; AccessibilityService will tap mic ----
+    // ---- launch ChatGPT: bring our Activity (has turnScreenOn in manifest), then ChatGPT ----
     private fun triggerChatGptVoice() {
-        val pkg = "com.openai.chatgpt"
-        val launch = packageManager.getLaunchIntentForPackage(pkg)?.apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-        if (launch != null) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            val wl = pm.newWakeLock(
-                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                "AegisWake:voiceWake"
-            )
-            wl.acquire(3000)
-            startActivity(launch)
+        // Wake the screen briefly
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        @Suppress("DEPRECATION")
+        val wl = pm.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "AegisWake:voiceWake"
+        )
+        wl.acquire(3000)
+
+        // Bring our activity up (it has showWhenLocked/turnScreenOn in manifest)
+        try {
+            MainActivity.startVoiceFlow(this)
+        } catch (e: Exception) {
+            notifyError("Launch error: ${e.message}")
         }
     }
 
@@ -194,8 +274,8 @@ class MainService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        val pi = android.app.PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), android.app.PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Aegis is listening")
@@ -210,6 +290,14 @@ class MainService : Service() {
         NotificationManagerCompat.from(this).notify(NOTIF_ID, buildNotification(text))
     }
 
+    private fun tickUi(text: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastUiTick >= 250L) {
+            lastUiTick = now
+            updateNotification(text)
+        }
+    }
+
     private fun notifyError(msg: String) {
         NotificationManagerCompat.from(this).notify(
             ERR_ID,
@@ -221,17 +309,17 @@ class MainService : Service() {
         )
     }
 
-    // ---- robust model loader ----
+    // ---- model loader ----
     private fun loadModelFromAssets(assetName: String): ByteBuffer {
-        // fast path if not compressed
         try {
             assets.openFd(assetName).use { afd ->
-                val input = java.io.FileInputStream(afd.fileDescriptor)
-                val ch = input.channel
-                return ch.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+                FileChannel.MapMode.READ_ONLY.let { mode ->
+                    return FileInputStream(afd.fileDescriptor).channel
+                        .map(mode, afd.startOffset, afd.length)
+                }
             }
         } catch (_: Exception) {
-            // fallback if asset got compressed
+            // compressed in APK
             assets.open(assetName).use { input ->
                 val bos = ByteArrayOutputStream()
                 val buf = ByteArray(16 * 1024)
@@ -241,8 +329,9 @@ class MainService : Service() {
                     bos.write(buf, 0, r)
                 }
                 val bytes = bos.toByteArray()
-                val bb = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
-                bb.put(bytes); bb.rewind(); return bb
+                return ByteBuffer.allocateDirect(bytes.size)
+                    .order(ByteOrder.nativeOrder())
+                    .apply { put(bytes); rewind() }
             }
         }
     }
