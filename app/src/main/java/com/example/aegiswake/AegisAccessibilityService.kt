@@ -3,9 +3,11 @@ package com.example.aegiswake
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
-import android.content.Intent
 import android.graphics.Path
 import android.graphics.Rect
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
 import android.util.Log
 import android.util.TypedValue
 import android.view.accessibility.AccessibilityEvent
@@ -37,6 +39,52 @@ class AegisAccessibilityService : AccessibilityService() {
     @Volatile private var pendingPress = false
     fun requestPressButton() { pendingPress = true }
 
+    private val pollIntervalMs = 1000L
+    @Volatile private var serviceRunning = false
+
+    private fun isChatGptVisible(): Boolean {
+        val wins = windows ?: return false
+        for (w in wins) {
+            val r = w.root ?: continue
+            val pkg = r.packageName?.toString()?.lowercase() ?: continue
+            if (pkg.contains("openai")) return true
+        }
+        return false
+    }
+
+    private val serviceStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == MainService.ACTION_STATE) {
+                serviceRunning = intent.getBooleanExtra(MainService.EXTRA_RUNNING, false)
+            }
+        }
+    }
+
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val gptVisible = isChatGptVisible()
+                if (gptVisible) {
+                    // ensure wakeword service is stopped
+                    if (serviceRunning) {
+                        sendBroadcast(Intent(MainService.ACTION_STOP_SELF).setPackage(packageName))
+                    }
+                } else {
+                    // ensure wakeword service is running
+                    if (!serviceRunning) {
+                        androidx.core.content.ContextCompat.startForegroundService(
+                            this@AegisAccessibilityService,
+                            Intent(this@AegisAccessibilityService, MainService::class.java)
+                        )
+                    }
+                }
+            } finally {
+                h.postDelayed(this, pollIntervalMs)
+            }
+        }
+    }
+
+
     override fun onServiceConnected() {
         instance = this
         serviceInfo = AccessibilityServiceInfo().apply {
@@ -47,8 +95,26 @@ class AegisAccessibilityService : AccessibilityService() {
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
-        Log.d(TAG, "Accessibility connected")
+
+        // listen for service state broadcasts
+        val f = android.content.IntentFilter().apply { addAction(MainService.ACTION_STATE) }
+        val flags = if (android.os.Build.VERSION.SDK_INT >= 33)
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED else 0
+        androidx.core.content.ContextCompat.registerReceiver(this, serviceStateReceiver, f, flags)
+
+        // start watchdog loop
+        h.postDelayed(pollRunnable, 500)
     }
+
+    override fun onDestroy() {
+        try { unregisterReceiver(serviceStateReceiver) } catch (_: Exception) {}
+        h.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
+
+    override fun onInterrupt() {}
+
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!pendingPress) return
@@ -67,8 +133,6 @@ class AegisAccessibilityService : AccessibilityService() {
         attempt = 0
         h.postDelayed(::tryStartVoiceLoop, 450)
     }
-
-    override fun onInterrupt() {}
 
     private fun tryStartVoiceLoop() {
         if (attempt >= maxAttempts) { Log.w(TAG, "Gave up after $attempt attempts"); return }

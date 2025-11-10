@@ -187,6 +187,8 @@ class MainActivity : ComponentActivity() {
         AegisAccessibilityService.instance?.requestPressButton()
 
         // Launch ChatGPT
+        // Stop wakeword service immediately before opening ChatGPT
+        sendBroadcast(Intent(MainService.ACTION_STOP_SELF).setPackage(packageName))
         startActivity(launch)
     }
 

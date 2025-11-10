@@ -1,5 +1,12 @@
 package com.example.aegiswake
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
+import android.provider.Settings
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -34,6 +41,7 @@ class MainService : Service() {
     private val WARMUP_MS = 1200L
     private val COOLDOWN_MS = 5000L
     private val DETECT_THRESH = 0.88f
+    private val RMS_LIMIT_SILENCE = 0.05f
 
     // 0.88 = Doesnt Work
     // 0.87 = Works if super duper close to the mic
@@ -64,11 +72,119 @@ class MainService : Service() {
     private var ringPos = 0
     private var filled = 0
 
+    private val CHATGPT_PKG = "com.openai.chatgpt"
+    private val WATCH_INTERVAL_MS = 1000L
+    private val watchHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    @Volatile private var lastPausedByWatchdog = false
+
+    companion object {
+        const val ACTION_STOP_SELF   = "com.example.aegiswake.STOP_SELF"
+        const val ACTION_STATE       = "com.example.aegiswake.STATE"
+        const val EXTRA_RUNNING      = "running"
+    }
+
+    private fun sendState(running: Boolean) {
+        val i = Intent(ACTION_STATE).setPackage(packageName).putExtra(EXTRA_RUNNING, running)
+        sendBroadcast(i)
+    }
+
+
+    private fun hasMicPerm(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasNotifPerm(): Boolean =
+        if (Build.VERSION.SDK_INT < 33) true
+        else ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasUsageAccess(): Boolean {
+        return try {
+            val appOps = getSystemService(Context.APP_OPS_SERVICE) as android.app.AppOpsManager
+            val mode = appOps.unsafeCheckOpNoThrow(
+                "android:get_usage_stats",
+                android.os.Process.myUid(),
+                packageName
+            )
+            mode == android.app.AppOpsManager.MODE_ALLOWED
+        } catch (_: Exception) { false }
+    }
+
+//    private fun promptUsageAccessOnce() {
+//        // Optional: you can rate-limit this toast/intention
+//        notifyError("Grant Usage Access so Aegis can pause mic while ChatGPT is running.")
+//        val i = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+//        try { startActivity(i) } catch (_: Exception) { /* ignore */ }
+//    }
+
+    private fun isChatGptAliveOrForeground(): Boolean {
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return false
+        val now = SystemClock.elapsedRealtime()
+        // UsageStats needs wallclock time, not elapsedRealtime; use System.currentTimeMillis()
+        val tNow = System.currentTimeMillis()
+        val tFrom = tNow - 60_000  // last 60s
+
+        val events = usm.queryEvents(tFrom, tNow)
+        var lastType = -1
+        val e = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(e)
+            if (e.packageName == CHATGPT_PKG) {
+                lastType = e.eventType
+            }
+        }
+        // Consider alive for a broad set of states (foreground or still in memory):
+        // MOVE_TO_FOREGROUND / ACTIVITY_RESUMED => definitely alive
+        // ACTIVITY_PAUSED / ACTIVITY_STOPPED / MOVE_TO_BACKGROUND => app still exists (we pause)
+        // Only resume when there were *no* events in the window (likely killed) or explicit DESTROYED.
+        return when (lastType) {
+            UsageEvents.Event.MOVE_TO_FOREGROUND,
+            UsageEvents.Event.ACTIVITY_RESUMED,
+            UsageEvents.Event.ACTIVITY_PAUSED,
+            UsageEvents.Event.ACTIVITY_STOPPED,
+            UsageEvents.Event.MOVE_TO_BACKGROUND -> true
+            else -> {
+                // If we saw no events for ChatGPT in the last 60 s, treat it as not alive
+                lastType != -1 // -1 → no events → not alive
+            }
+        }
+    }
+
+    private val controlReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            when (i?.action) {
+                ACTION_STOP_SELF -> {
+                    // ensure audio thread halts, then stop service
+                    running = false
+                    try { audioThread?.join(500) } catch (_: Exception) {}
+                    updateNotification("Suspended (ChatGPT active)")
+                    stopSelf()
+                }
+            }
+        }
+    }
+
+
     override fun onCreate() {
         super.onCreate()
         ensureChannel()
         startForeground(NOTIF_ID, buildNotification("Starting…"))
         serviceStartAt = SystemClock.elapsedRealtime()
+
+        val filter = android.content.IntentFilter().apply {
+            addAction(ACTION_STOP_SELF)
+        }
+        val flags = if (Build.VERSION.SDK_INT >= 33)
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED else 0
+        androidx.core.content.ContextCompat.registerReceiver(this, controlReceiver, filter, flags)
+
+        if (!hasMicPerm()) {
+            notifyError("Mic permission missing. Open app to grant microphone access.")
+            // stay in foreground with status; do not start loop
+            sendState(false)
+            return
+        }
 
         try {
             val opts = Interpreter.Options().apply { setNumThreads(2) }
@@ -76,29 +192,42 @@ class MainService : Service() {
             updateNotification("Model loaded, preparing mic…")
         } catch (e: Exception) {
             notifyError("Model init error: ${e.message ?: "unknown"}")
-            stopSelf()
-            return
+            sendState(false)
+            stopSelf(); return
         }
 
         running = true
         audioThread = Thread({ audioLoop() }, "AegisWake-AudioLoop").also { it.start() }
+        sendState(true)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+
 
     override fun onDestroy() {
+        try { unregisterReceiver(controlReceiver) } catch (_: Exception) {}
         running = false
         try { audioThread?.join(800) } catch (_: Exception) {}
         try { tflite?.close() } catch (_: Exception) {}
         tflite = null
+        sendState(false)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?) = null
 
     // ---- audio + inference loop ----
+    @SuppressLint("MissingPermission") // guarded by hasMicPerm() checks
     private fun audioLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+
+        if (!hasMicPerm()) {
+            notifyError("Mic permission missing — stopping capture.")
+            return
+        }
 
         // Build AudioRecord with fallbacks
         val attemptOrder = listOf(
@@ -129,6 +258,10 @@ class MainService : Service() {
                     )
                     .setBufferSizeInBytes(bufBytes)
                     .build()
+            } catch (e: SecurityException) {
+                // Permission revoked mid-run or platform blocked background capture
+                notifyError("Mic security error (${e.message}).")
+                null
             } catch (_: Exception) { null }
 
             if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) {
@@ -152,11 +285,20 @@ class MainService : Service() {
         val scores = ArrayDeque<Float>() // simple smoothing
 
         try {
+            if (!hasMicPerm()) {
+                notifyError("Mic permission missing at startRecording().")
+                record.release()
+                return
+            }
             record.startRecording()
+        } catch (e: SecurityException) {
+            notifyError("Mic start denied (${e.message}).")
+            record.release()
+            return
         } catch (e: Exception) {
             notifyError("Mic start failed: ${e.message}")
             record.release()
-            stopSelf(); return
+            return
         }
 
         if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
@@ -209,7 +351,7 @@ class MainService : Service() {
                 idx++; if (idx == WINDOW_SAMPLES) idx = 0
             }
             val rms = sqrt(sumSq / WINDOW_SAMPLES).toFloat()
-            if (rms < 0.01f) {
+            if (rms < RMS_LIMIT_SILENCE) {
                 tickUi("Silence… RMS=${"%.3f".format(rms)} ($sourceUsed)")
                 continue
             }
@@ -286,9 +428,18 @@ class MainService : Service() {
             .build()
     }
 
+    @SuppressLint("MissingPermission") // guarded by hasNotifPerm()
     private fun updateNotification(text: String) {
-        NotificationManagerCompat.from(this).notify(NOTIF_ID, buildNotification(text))
+        if (!hasNotifPerm()) {
+            // Optional: still keep foreground notification (required for service)
+            // but skip user updates
+            android.util.Log.w("AegisWake", "No POST_NOTIFICATIONS permission — skipping update.")
+            return
+        }
+        NotificationManagerCompat.from(this)
+            .notify(NOTIF_ID, buildNotification(text))
     }
+
 
     private fun tickUi(text: String) {
         val now = SystemClock.elapsedRealtime()
@@ -298,7 +449,12 @@ class MainService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission") // guarded by hasNotifPerm()
     private fun notifyError(msg: String) {
+        if (!hasNotifPerm()) {
+            android.util.Log.w("AegisWake", "No POST_NOTIFICATIONS permission — cannot show error: $msg")
+            return
+        }
         NotificationManagerCompat.from(this).notify(
             ERR_ID,
             NotificationCompat.Builder(this, CHANNEL_ID)
